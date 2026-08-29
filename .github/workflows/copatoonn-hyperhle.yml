@@ -1,0 +1,166 @@
+- name: Patch Dynarmic for iOS 18 JIT
+  shell: bash
+  run: |
+    python3 <<'PY'
+    import re
+    from pathlib import Path
+
+    path = Path(
+        "vendor/dynarmic/externals/oaknut/include/oaknut/code_block.hpp"
+    )
+
+    if not path.is_file():
+        raise SystemExit(f"File not found: {path}")
+
+    s = path.read_text(encoding="utf-8").replace("\r\n", "\n")
+
+    # Work only inside the CodeBlock constructor.
+    marker = "explicit CodeBlock(std::size_t size)"
+    if marker not in s:
+        raise SystemExit("CodeBlock constructor not found")
+
+    before, after = s.split(marker, 1)
+
+    # Replace the physical-iPhone JIT26 broker allocation.
+    pattern = re.compile(
+        r"#\s*if\s+TARGET_OS_IPHONE\s*&&\s*!TARGET_OS_SIMULATOR\s*\n"
+        r".*?"
+        r"(?=#\s*elif\s+TARGET_OS_IPHONE\b)",
+        re.DOTALL,
+    )
+
+    replacement = """#    if TARGET_OS_IPHONE && !TARGET_OS_SIMULATOR
+            // iOS 18.x pre-TXM JIT path.
+            m_memory = static_cast<std::uint32_t*>(mmap(
+                nullptr,
+                size,
+                PROT_READ | PROT_EXEC,
+                MAP_ANON | MAP_PRIVATE,
+                -1,
+                0));
+            m_wmemory = m_memory;
+    """
+
+    after, count = pattern.subn(replacement, after, count=1)
+
+    if count != 1:
+        raise SystemExit(
+            f"Could not patch iPhone constructor: matches={count}"
+        )
+
+    s = before + marker + after
+
+    # Fix the mmap failure check.
+    failure_pattern = re.compile(
+        r"#if defined\(_WIN32\)\s*\n"
+        r"\s*if \(m_memory == nullptr\)\s*\n"
+        r"#elif defined\(__APPLE__\) && TARGET_OS_IPHONE "
+        r"&& !TARGET_OS_SIMULATOR\s*\n"
+        r"\s*if \(m_memory == nullptr \|\| m_wmemory == nullptr\)\s*\n"
+        r"#else\s*\n"
+        r"\s*if \(m_memory == MAP_FAILED\)\s*\n"
+        r"#endif"
+    )
+
+    failure_replacement = """#if defined(_WIN32)
+            if (m_memory == nullptr)
+    #else
+            if (m_memory == MAP_FAILED)
+    #endif"""
+
+    s, count = failure_pattern.subn(
+        failure_replacement,
+        s,
+        count=1,
+    )
+
+    if count != 1:
+        raise SystemExit(
+            f"Could not patch mmap failure check: matches={count}"
+        )
+
+    # Remove dual-map destructor logic on physical iPhones.
+    destructor_marker = "~CodeBlock()"
+    if destructor_marker not in s:
+        raise SystemExit("CodeBlock destructor not found")
+
+    destructor_pos = s.index(destructor_marker)
+    first = s[:destructor_pos]
+    rest = s[destructor_pos:]
+
+    rest, count = re.subn(
+        r"#\s*if\s+defined\(__APPLE__\)\s*&&\s*TARGET_OS_IPHONE\s*"
+        r"&&\s*!TARGET_OS_SIMULATOR\s*\n"
+        r".*?"
+        r"#\s*endif\s*\n",
+        "",
+        rest,
+        count=1,
+        flags=re.DOTALL,
+    )
+
+    if count != 1:
+        raise SystemExit(
+            f"Could not patch destructor: matches={count}"
+        )
+
+    s = first + rest
+
+    # Enable mprotect RW/RX switching on physical iPhones too.
+    simulator_pattern = re.compile(
+        r"#elif defined\(__APPLE__\) && TARGET_OS_IPHONE "
+        r"&& TARGET_OS_SIMULATOR"
+    )
+
+    count = len(simulator_pattern.findall(s))
+
+    if count != 2:
+        raise SystemExit(
+            f"Expected 2 protect/unprotect branches, found {count}"
+        )
+
+    s = simulator_pattern.sub(
+        "#elif defined(__APPLE__) && TARGET_OS_IPHONE",
+        s,
+    )
+
+    # Make broker detach a no-op.
+    detach_pattern = re.compile(
+        r"(?m)^    void detach_jit_server\(\)\s*\n"
+        r"^    \{\s*\n"
+        r".*?"
+        r"^    \}\s*\n"
+        r"(?=^    void invalidate)",
+        re.DOTALL | re.MULTILINE,
+    )
+
+    s, count = detach_pattern.subn(
+        "    void detach_jit_server() {}\n",
+        s,
+        count=1,
+    )
+
+    if count != 1:
+        raise SystemExit(
+            f"Could not patch detach_jit_server: matches={count}"
+        )
+
+    path.write_text(s, encoding="utf-8", newline="\n")
+    print("Dynarmic iOS 18 patch applied successfully.")
+    PY
+
+    echo "===== VERIFY PATCH ====="
+
+    FILE="vendor/dynarmic/externals/oaknut/include/oaknut/code_block.hpp"
+
+    grep -nF "m_wmemory = m_memory" "$FILE"
+
+    if ! grep -qF \
+      "#elif defined(__APPLE__) && TARGET_OS_IPHONE" \
+      "$FILE"
+    then
+      echo "ERROR: iPhone protect/unprotect branches were not patched"
+      exit 1
+    fi
+
+    echo "Patch verification successful."
